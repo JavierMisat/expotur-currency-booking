@@ -19,7 +19,7 @@ function lc_forzar_moneda_base_en_frontend_global() {
     $moneda_base_tienda = lc_get_store_base_currency(); // Obtiene COP
 
     // Si estamos en el carrito o checkout, no hacemos nada aquí, WOOCS debe manejarlo.
-    if (is_cart() || is_checkout()) {
+    if (is_cart() || is_checkout() || is_wc_endpoint_url('order-pay') || is_wc_endpoint_url('order-received')) {
         // Podríamos incluso asegurarnos de que WOOCS está usando la moneda que el usuario seleccionó,
         // pero usualmente WOOCS maneja esto bien por sí mismo en estas páginas.
         return;
@@ -42,8 +42,8 @@ function lc_filter_woocommerce_currency_global($currency_code) {
         return $currency_code; // Devuelve el código de moneda actual en admin o si WOOCS no está.
     }
 
-    // En carrito o checkout, permitir que WOOCS (u otro filtro con mayor prioridad) determine la moneda.
-    if (is_cart() || is_checkout()) {
+    // En carrito o checkout, o páginas de pago/pedido recibido, permitir que WOOCS determine la moneda.
+    if (is_cart() || is_checkout() || is_wc_endpoint_url('order-pay') || is_wc_endpoint_url('order-received')) {
         global $WOOCS;
         return $WOOCS->current_currency; // Devolver la moneda activa de WOOCS.
     }
@@ -103,9 +103,15 @@ if (!function_exists('lc_get_selected_checkout_currency_woocs')) {
  */
 if (!function_exists('lc_convert_from_base_to_target_woocs')) {
     function lc_convert_from_base_to_target_woocs($amount_in_base_currency, $target_currency_code) {
+        // Asegurarse de que el monto sea un float para WOOCS
+        $amount_in_base_currency = floatval($amount_in_base_currency);
+
         if (!class_exists('WOOCS') || empty($amount_in_base_currency) || !is_numeric($amount_in_base_currency)) {
-            return $amount_in_base_currency; // No convertir si WOOCS no está o el monto no es válido.
+            // Si el monto es 0, o WOOCS no está, o no es numérico, devolverlo tal cual.
+             if ($amount_in_base_currency === 0.0) return 0.0;
+            return $amount_in_base_currency;
         }
+
 
         global $WOOCS;
         $store_base_currency = lc_get_store_base_currency(); // ej. COP
@@ -113,18 +119,11 @@ if (!function_exists('lc_convert_from_base_to_target_woocs')) {
         if ($target_currency_code === $store_base_currency) {
             return $amount_in_base_currency; // No se necesita conversión.
         }
-
-        // WOOCS puede convertir directamente si conoce las tasas.
-        // $WOOCS->raw_woocommerce_price($amount_in_base_currency) devuelve el precio en la moneda actual de WOOCS.
-        // Para convertir a un target específico desde la base, necesitamos un poco más.
-        // Primero, aseguramos que el precio esté realmente en la moneda base para WOOCS.
-        $price_in_current_woocs_currency = $WOOCS->woocs_exchange_value(floatval($amount_in_base_currency), $store_base_currency, $target_currency_code);
         
-        return $price_in_current_woocs_currency;
-
-        // Alternativa más simple si el monto ya está "pensado" por WOOCS como base:
-        // return $WOOCS->raw_woocommerce_price($amount_in_base_currency, $target_currency_code);
-        // Sin embargo, es más seguro usar woocs_exchange_value si el monto viene crudo en COP.
+        // Usar woocs_exchange_value para convertir de la moneda base a la moneda objetivo.
+        $converted_amount = $WOOCS->woocs_exchange_value($amount_in_base_currency, $store_base_currency, $target_currency_code);
+        
+        return $converted_amount;
     }
 }
 
@@ -144,37 +143,24 @@ function lc_convert_price_string_callback_woocs($matches) {
     $store_base_currency = lc_get_store_base_currency(); // ej. COP
     $selected_checkout_currency = lc_get_selected_checkout_currency_woocs(); // ej. USD
 
-    // Si la moneda seleccionada es la misma que la base, o si no se puede determinar,
-    // no se hace conversión aquí, solo se reformatea con wc_price para consistencia.
-    if ($selected_checkout_currency === $store_base_currency || empty($selected_checkout_currency)) {
-        // Aunque no haya conversión de valor, reformatear con wc_price en la moneda base
-        // asegura que el formato (símbolo, decimales) sea el correcto para esa moneda.
-        $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop); // Quitar separador de miles (asume . para miles)
-        $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);   // Reemplazar coma decimal por punto
-        $raw_amount_cop = floatval($cleaned_amount_string);
+    // Convertir el string del monto (que está en COP) a un float.
+    // Asumimos que el formato de número en el string es: "." como separador de miles, "," como decimal.
+    $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop);
+    $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);
+    $raw_amount_cop = floatval($cleaned_amount_string);
 
-        if ($raw_amount_cop >= 0) {
+    if ($selected_checkout_currency === $store_base_currency || empty($selected_checkout_currency)) {
+        if ($raw_amount_cop >= 0) { // Incluye 0.00
             $formatted_price = wc_price($raw_amount_cop, array('currency' => $store_base_currency));
             return $leading_text . $formatted_price;
         }
-        return $matches[0]; // Devolver original si el monto no es válido
+        return $matches[0];
     }
 
-    // Convertir el string del monto (que está en COP) a un float.
-    // Asumimos que el formato de número en el string es: "." como separador de miles, "," como decimal.
-    // Ajustar si tu formato COP es diferente. WooCommerce internamente usa "." como decimal.
-    $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop); // Quitar separador de miles (asume . para miles)
-    $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);   // Reemplazar coma decimal por punto
-    $raw_amount_cop = floatval($cleaned_amount_string);
 
     if ($raw_amount_cop >= 0) { // Incluir montos de 0.00
-        // Convertir el monto de COP a la moneda seleccionada en el checkout usando WOOCS.
         $converted_amount = lc_convert_from_base_to_target_woocs($raw_amount_cop, $selected_checkout_currency);
-
-        // Formatear el monto convertido usando wc_price con la moneda de checkout.
         $converted_price_html = wc_price($converted_amount, array('currency' => $selected_checkout_currency));
-
-        // Reconstruir el string.
         return $leading_text . $converted_price_html;
     }
 
@@ -190,32 +176,23 @@ function lc_convert_price_string_callback_woocs($matches) {
 add_filter('ovatb_cart_item_subtotal', 'lc_filter_ovatb_strings_in_cart_checkout', 30, 4);
 add_filter('ovatb_order_formatted_line_subtotal', 'lc_filter_ovatb_strings_in_cart_checkout', 30, 3); // Para página de "pedido recibido" y correos.
 function lc_filter_ovatb_strings_in_cart_checkout($html_content_input, $arg2 = null, $arg3 = null, $arg4 = null) {
-    // Este filtro se aplica tanto a 'ovatb_cart_item_subtotal' (4 args) como a 'ovatb_order_formatted_line_subtotal' (3 args).
-    // El contenido HTML relevante es siempre el primer argumento.
     $html_content = $html_content_input;
 
-    if (!class_exists('WOOCS') || (!is_cart() && !is_checkout() && !is_wc_endpoint_url('view-order'))) {
+    if (!class_exists('WOOCS') || (!is_cart() && !is_checkout() && !is_wc_endpoint_url('view-order') && !(is_admin() && defined('DOING_AJAX') && $_REQUEST['action'] === 'woocommerce_load_order_items'))) {
         // Solo actuar en carrito, checkout, o página de ver pedido, y si WOOCS está activo.
-        // is_wc_endpoint_url('view-order') es para la página de "pedido recibido/ver pedido".
+        // También en la carga de items de pedido en el admin via AJAX para emails.
         return $html_content;
     }
 
-    // Patrón de Regex para capturar los montos en los strings de "ova-tour-booking".
-    // Grupo 1: El texto que precede al precio (ej. "(7% deposit of ", "<dt>Remaining:</dt><dd...>")
-    // Grupo 2: El monto numérico (ej. "1.860.000,00")
-    // Este patrón busca el span generado por wc_price y captura el texto anterior relevante.
     $price_string_pattern = '/((?:\(\s*(?:\d+%\s+)?deposit of\s+)|(?:<dt>Remaining:<\/dt><dd[^>]*>))(?:[A-Z]{0,3})?(?:&nbsp;|\s)?<span class="woocommerce-Price-amount amount"><bdi>([0-9,.]+)<\/bdi><\/span>/';
-
     $html_content_procesado = preg_replace_callback($price_string_pattern, 'lc_convert_price_string_callback_woocs', $html_content);
     
-    if (null === $html_content_procesado) {
-        // Si preg_replace_callback falla (ej. error en regex), devolver el original para evitar errores fatales.
-        // Considera loguear el error aquí.
-        // error_log("LC Debug: preg_replace_callback falló en lc_filter_ovatb_strings_in_cart_checkout. Patrón: " . $price_string_pattern);
+    if (null === $html_content_procesado && preg_last_error() !== PREG_NO_ERROR) {
+        // error_log("LC Debug: preg_replace_callback falló en lc_filter_ovatb_strings_in_cart_checkout. Error: " . preg_last_error_msg() . " Patrón: " . $price_string_pattern);
         return $html_content;
     }
 
-    return $html_content_procesado;
+    return $html_content_procesado ?: $html_content; // Devuelve el procesado o el original si el procesado es null/false
 }
 
 /**
@@ -227,29 +204,23 @@ function lc_filter_ovatb_remaining_total_cart_table($html_value) {
         return $html_value;
     }
 
-    // Patrón para el total restante dentro de la etiqueta <strong>: "<strong>$1.000.000,00</strong>"
-    // Grupo 1: El monto numérico.
     $pattern = '/<strong>(?:[A-Z]{0,3})?(?:&nbsp;|\s)?<span class="woocommerce-Price-amount amount"><bdi>([0-9,.]+)<\/bdi><\/span><\/strong>/';
-
     $html_value_procesado = preg_replace_callback($pattern, function($matches) {
-        $amount_string_from_cop = $matches[1]; // El monto "1.860.000,00"
+        $amount_string_from_cop = $matches[1];
 
         $store_base_currency = lc_get_store_base_currency();
         $selected_checkout_currency = lc_get_selected_checkout_currency_woocs();
+        
+        $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop);
+        $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);
+        $raw_amount_cop = floatval($cleaned_amount_string);
 
         if ($selected_checkout_currency === $store_base_currency || empty($selected_checkout_currency)) {
-            $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop);
-            $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);
-            $raw_amount_cop = floatval($cleaned_amount_string);
             if ($raw_amount_cop >= 0) {
                 return '<strong>' . wc_price($raw_amount_cop, array('currency' => $store_base_currency)) . '</strong>';
             }
             return $matches[0];
         }
-
-        $cleaned_amount_string = str_replace('.', '', $amount_string_from_cop);
-        $cleaned_amount_string = str_replace(',', '.', $cleaned_amount_string);
-        $raw_amount_cop = floatval($cleaned_amount_string);
 
         if ($raw_amount_cop >= 0) {
             $converted_amount = lc_convert_from_base_to_target_woocs($raw_amount_cop, $selected_checkout_currency);
@@ -259,9 +230,133 @@ function lc_filter_ovatb_remaining_total_cart_table($html_value) {
         return $matches[0];
     }, $html_value);
 
-    if (null === $html_value_procesado) {
-        // error_log("LC Debug: preg_replace_callback falló en lc_filter_ovatb_remaining_total_cart_table. Patrón: " . $pattern);
+    if (null === $html_value_procesado && preg_last_error() !== PREG_NO_ERROR) {
+        // error_log("LC Debug: preg_replace_callback falló en lc_filter_ovatb_remaining_total_cart_table. Error: " . preg_last_error_msg() . " Patrón: " . $pattern);
         return $html_value;
     }
-    return $html_value_procesado;
+    return $html_value_procesado ?: $html_value;
 }
+
+
+/**
+ * PARTE 3: PERMITIR SOLO UN TOUR EN EL CARRITO A LA VEZ
+ */
+
+add_filter('woocommerce_add_to_cart_validation', 'lc_permitir_solo_un_tour_por_compra', 20, 3);
+/**
+ * Valida que solo se pueda añadir un tour al carrito si este ya contiene un tour.
+ *
+ * @param bool $passed Si la validación ha pasado.
+ * @param int $product_id ID del producto que se está añadiendo.
+ * @param int $quantity Cantidad del producto.
+ * @return bool
+ */
+function lc_permitir_solo_un_tour_por_compra($passed, $product_id, $quantity) {
+    // Obtener el tipo de producto que se está intentando añadir.
+    $product_being_added = wc_get_product($product_id);
+    if (!$product_being_added) {
+        return false; // No se pudo obtener el producto.
+    }
+    $product_type_being_added = $product_being_added->get_type();
+
+    // Verificar si ya hay un tour en el carrito.
+    $tour_in_cart = false;
+    if (WC()->cart && !WC()->cart->is_empty()) {
+        foreach (WC()->cart->get_cart() as $cart_item_key => $cart_item) {
+            $_product = $cart_item['data'];
+            if ($_product && $_product->get_type() === 'ovatb_tour') {
+                $tour_in_cart = true;
+                break;
+            }
+        }
+    }
+
+    // Si se está intentando añadir un tour y ya hay un tour en el carrito.
+    if ($product_type_being_added === 'ovatb_tour' && $tour_in_cart) {
+        // Mostrar un aviso al usuario.
+        // Traduce este mensaje según sea necesario.
+        wc_add_notice(__('Solo puedes procesar la reserva de un tour a la vez. Por favor, completa o vacía tu reserva actual antes de añadir otro tour.', 'woocommerce'), 'error');
+        return false; // Prevenir que se añada al carrito.
+    }
+
+    return $passed; // Permitir añadir si no se cumplen las condiciones anteriores.
+}
+
+/**
+ * PARTE 4: VACIAR CARRITO SI SE ABANDONA EL CHECKOUT (CON EXCEPCIONES PARA PASARELAS)
+ */
+
+add_action('template_redirect', 'lc_vaciar_carrito_al_abandonar_checkout', 20);
+/**
+ * Vacía el carrito si el usuario navega fuera del checkout a una página no relacionada con el pago.
+ */
+function lc_vaciar_carrito_al_abandonar_checkout() {
+    // Asegurarse de que WooCommerce y las sesiones están disponibles.
+    if (!function_exists('WC') || !WC()->session) {
+        return;
+    }
+    
+    // Iniciar sesión si aún no está iniciada (necesario para WC()->session).
+    if ( ! WC()->session->has_session() ) {
+        WC()->session->set_customer_session_cookie( true );
+    }
+
+    $user_was_on_checkout = WC()->session->get('lc_user_was_on_checkout_page', false);
+
+    // Si el usuario está actualmente en la página de checkout.
+    if (is_checkout() && !is_wc_endpoint_url('order-pay') && !is_wc_endpoint_url('order-received')) {
+        WC()->session->set('lc_user_was_on_checkout_page', true);
+        return; // No hacer nada más.
+    }
+
+    // Si el usuario estaba en el checkout y ahora está en otra página.
+    if ($user_was_on_checkout) {
+        // Definir URLs o partes de URLs que indican que el usuario está en una pasarela de pago.
+        // ESTA LISTA DEBE SER PERSONALIZADA SEGÚN TUS PASARELAS DE PAGO.
+        $payment_gateway_urls_patterns = array(
+            'mercadopago', // Ejemplo para Mercado Pago
+            'paypal.com',  // Ejemplo para PayPal
+            'payu.com',    // Ejemplo para PayU
+            'stripe.com',  // Ejemplo para Stripe (si redirige fuera)
+            // Añade aquí otras partes de URLs de tus pasarelas.
+            // También considera los endpoints de WooCommerce para "pagar pedido" o "pedido recibido".
+            wc_get_endpoint_url('order-pay', '', wc_get_checkout_url()),
+            wc_get_endpoint_url('order-received', '', wc_get_checkout_url())
+        );
+        
+        $current_url = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http") . "://$_SERVER[HTTP_HOST]$_SERVER[REQUEST_URI]";
+        $is_on_payment_gateway_or_confirmation = false;
+
+        foreach ($payment_gateway_urls_patterns as $pattern) {
+            if (strpos($current_url, $pattern) !== false) {
+                $is_on_payment_gateway_or_confirmation = true;
+                break;
+            }
+        }
+        
+        // Si el usuario NO está en una página de pasarela de pago conocida ni en confirmación de pedido.
+        if (!$is_on_payment_gateway_or_confirmation && !is_cart()) { // No vaciar si va al carrito
+            if (WC()->cart && !WC()->cart->is_empty()) {
+                WC()->cart->empty_cart();
+                // Opcional: Mostrar un aviso al usuario.
+                // Traduce este mensaje según sea necesario.
+                // wc_add_notice(__('Tu carrito ha sido vaciado porque abandonaste el proceso de pago.', 'woocommerce'), 'notice');
+            }
+        }
+        
+        // En cualquier caso, si salió del checkout (y no es una página de pasarela o confirmación),
+        // o si completó el pedido, o está pagando, reseteamos la bandera.
+        // Si está en una pasarela, la bandera se reseteará al volver a la tienda o al completar.
+        if (!$is_on_payment_gateway_or_confirmation || is_wc_endpoint_url('order-received')) {
+             WC()->session->set('lc_user_was_on_checkout_page', false);
+        }
+    }
+}
+
+// Podrías necesitar filtros similares para otros totales si "ova-tour-booking" los añade
+// de forma personalizada y no son convertidos automáticamente por WOOCS.
+// Por ejemplo, si hay un total de depósito en la tabla de totales:
+// add_filter('ovatb_get_cart_deposit_totals_html', 'lc_filter_ovatb_deposit_total_cart_table', 30, 1);
+// function lc_filter_ovatb_deposit_total_cart_table($html_value) { ... lógica similar ... }
+
+?>
